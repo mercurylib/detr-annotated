@@ -86,8 +86,8 @@ def get_args_parser():
 
     parser.add_argument('--output_dir', default='',
                         help='path where to save, empty for no saving')
-    parser.add_argument('--device', default='cuda',
-                        help='device to use for training / testing')
+    parser.add_argument('--device', default='mps' if torch.backends.mps.is_available() else 'cpu',
+                        help='device to use for training / testing (cuda/mps/cpu)')
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--resume', default='', help='resume from checkpoint')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
@@ -139,7 +139,7 @@ def main(args):
                                   weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
 
-    dataset_train = build_dataset(image_set='train', args=args)
+    dataset_train = build_dataset(image_set='val', args=args)   # 用划分为验证的数据集，跑通训练流程
     dataset_val = build_dataset(image_set='val', args=args)
 
     if args.distributed:

@@ -58,14 +58,24 @@ class DETR(nn.Module):
         """
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
+        # 1. backbone输出
         features, pos = self.backbone(samples)
+        # features: 多尺度特征图列表[f1,f2,f3,f4]
+        # pos: 对应的位置编码列表[p1,p2,p3,p4]
 
+        # 2. 取最后一层特征
         src, mask = features[-1].decompose()
+        # src: [B,C,H,W] 最后一层特征图
+        # mask: [B,H,W] padding mask
         assert mask is not None
+        # 3. 输入transformer
+        # self.input_proj(src) [B,C,H,W] -> [B,hidden_dim,H,W]
         hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
 
-        outputs_class = self.class_embed(hs)
-        outputs_coord = self.bbox_embed(hs).sigmoid()
+        # 4. 分类和回归
+        # hs: [L,B,N,C] 解码器输出
+        outputs_class = self.class_embed(hs)    # [L,B,N,num_classes+1]
+        outputs_coord = self.bbox_embed(hs).sigmoid()   # [L,B,N,4]
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
@@ -106,18 +116,23 @@ class SetCriterion(nn.Module):
         self.register_buffer('empty_weight', empty_weight)
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
-        """Classification loss (NLL)
-        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
-        """
-        assert 'pred_logits' in outputs
-        src_logits = outputs['pred_logits']
+        # 1. 获取预测的类别概率
+        src_logits = outputs['pred_logits']  # shape: [batch_size, num_queries, num_classes+1]
 
+        # 2. 获取匹配的索引
         idx = self._get_src_permutation_idx(indices)
+        
+        # 3. 构建目标类别
+        # 收集匹配上的真实标签
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        # 创建一个全是 num_classes (背景类) 的张量
         target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                     dtype=torch.int64, device=src_logits.device)
+        # 将匹配的位置填入真实类别
         target_classes[idx] = target_classes_o
 
+        # 4. 计算交叉熵损失
+        # empty_weight: 给背景类一个较小的权重(eos_coef=0.1)来处理正负样本不平衡
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
         losses = {'loss_ce': loss_ce}
 
@@ -126,16 +141,22 @@ class SetCriterion(nn.Module):
             losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
         return losses
 
-    @torch.no_grad()
+    @torch.no_grad()  # 注意这个装饰器，表示不计算梯度
     def loss_cardinality(self, outputs, targets, indices, num_boxes):
-        """ Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
-        This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
-        """
-        pred_logits = outputs['pred_logits']
+        pred_logits = outputs['pred_logits']  # [bs, num_queries, num_classes+1]
         device = pred_logits.device
+
+        # 1. 获取每张图片中真实目标的数量
         tgt_lengths = torch.as_tensor([len(v["labels"]) for v in targets], device=device)
         # Count the number of predictions that are NOT "no-object" (which is the last class)
+        # 例如: [3, 5] 表示第一张图有3个目标，第二张图有5个目标
+
+        # 2. 计算每张图片中预测为前景的数量
+        # pred_logits.shape[-1] - 1 是背景类的索引
         card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
+        # 例如: [4, 6] 表示第一张图预测了4个前景目标，第二张图预测了6个前景目标
+
+        # 3. 计算预测数量和真实数量之间的L1误差
         card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
         losses = {'cardinality_error': card_err}
         return losses
@@ -146,19 +167,28 @@ class SetCriterion(nn.Module):
            The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
         """
         assert 'pred_boxes' in outputs
-        idx = self._get_src_permutation_idx(indices)
-        src_boxes = outputs['pred_boxes'][idx]
-        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        # 1. 获取匹配的预测框索引
+        idx = self._get_src_permutation_idx(indices)  # 获取预测框的匹配索引
+        src_boxes = outputs['pred_boxes'][idx]  # 只取匹配的预测框
 
+        # 2. 获取目标框
+        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        # 将所有匹配的目标框拼接成一个张量
+
+        # 3. 计算L1损失
         loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+        # 计算预测框和目标框之间的L1损失，reduction='none'表示不进行归约
 
         losses = {}
-        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
+        losses['loss_bbox'] = loss_bbox.sum() / num_boxes  # 归一化损失
 
+        # 4. 计算GIoU损失
         loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
             box_ops.box_cxcywh_to_xyxy(src_boxes),
             box_ops.box_cxcywh_to_xyxy(target_boxes)))
-        losses['loss_giou'] = loss_giou.sum() / num_boxes
+        # 计算GIoU损失，使用对角线元素表示每个预测框与目标框的GIoU
+
+        losses['loss_giou'] = loss_giou.sum() / num_boxes  # 归一化GIoU损失
         return losses
 
     def loss_masks(self, outputs, targets, indices, num_boxes):
@@ -167,34 +197,42 @@ class SetCriterion(nn.Module):
         """
         assert "pred_masks" in outputs
 
-        src_idx = self._get_src_permutation_idx(indices)
-        tgt_idx = self._get_tgt_permutation_idx(indices)
-        src_masks = outputs["pred_masks"]
-        src_masks = src_masks[src_idx]
-        masks = [t["masks"] for t in targets]
+        # 1. 获取匹配的预测mask索引
+        src_idx = self._get_src_permutation_idx(indices)  # 获取预测mask的索引
+        tgt_idx = self._get_tgt_permutation_idx(indices)  # 获取目标mask的索引
+        src_masks = outputs["pred_masks"]  # 预测的mask
+        src_masks = src_masks[src_idx]  # 只取匹配的预测mask
+
+        # 2. 获取目标mask
+        masks = [t["masks"] for t in targets]  # 从目标中提取mask
         # TODO use valid to mask invalid areas due to padding in loss
-        target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()
-        target_masks = target_masks.to(src_masks)
-        target_masks = target_masks[tgt_idx]
+        target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()  # 将目标mask转换为张量
+        target_masks = target_masks.to(src_masks)  # 将目标mask移动到与预测mask相同的设备
+        target_masks = target_masks[tgt_idx]  # 只取匹配的目标mask
 
+        # 3. 将预测mask上采样到目标大小
         # upsample predictions to the target size
-        src_masks = interpolate(src_masks[:, None], size=target_masks.shape[-2:],
-                                mode="bilinear", align_corners=False)
-        src_masks = src_masks[:, 0].flatten(1)
+        src_masks = interpolate(src_masks[:, None], size=target_masks.shape[-2:], mode="bilinear", align_corners=False)
+        src_masks = src_masks[:, 0].flatten(1)  # 将上采样后的mask展平
 
-        target_masks = target_masks.flatten(1)
-        target_masks = target_masks.view(src_masks.shape)
+        target_masks = target_masks.flatten(1)  # 将目标mask展平
+        target_masks = target_masks.view(src_masks.shape)  # 确保目标mask与预测mask形状一致
+
+        # 4. 计算损失
         losses = {
-            "loss_mask": sigmoid_focal_loss(src_masks, target_masks, num_boxes),
-            "loss_dice": dice_loss(src_masks, target_masks, num_boxes),
+            "loss_mask": sigmoid_focal_loss(src_masks, target_masks, num_boxes),  # 计算焦点损失
+            "loss_dice": dice_loss(src_masks, target_masks, num_boxes),  # 计算 Dice 损失
         }
         return losses
 
     def _get_src_permutation_idx(self, indices):
+        # 将匈牙利匹配的结果转换为可以直接用于张量索引的格式
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         src_idx = torch.cat([src for (src, _) in indices])
         return batch_idx, src_idx
+        # batch_idx: 表示每个预测框属于哪张图片的索引
+        # src_idx: 表示每个预测框在所有预测框中的索引
 
     def _get_tgt_permutation_idx(self, indices):
         # permute targets following indices
@@ -219,23 +257,28 @@ class SetCriterion(nn.Module):
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
+        # 分离出非辅助输出
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
 
+        # 获取输出和真实标签之间的匹配【核心】
         # Retrieve the matching between the outputs of the last layer and the targets
         indices = self.matcher(outputs_without_aux, targets)
 
+        # 计算所有图片中目标框的总数
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets)
         num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_boxes)
-        num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
+        num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item() # 平均每个GPU的boxes数
 
+        # 计算主要损失
         # Compute all the requested losses
         losses = {}
         for loss in self.losses:
             losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
 
+        # 计算辅助损失
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
@@ -267,13 +310,16 @@ class PostProcess(nn.Module):
                           For visualization, this should be the image size after data augment, but before padding
         """
         out_logits, out_bbox = outputs['pred_logits'], outputs['pred_boxes']
+        # out_logits: [batch_size, num_queries, num_classes+1]
+        # out_bbox: [batch_size, num_queries, 4]
 
         assert len(out_logits) == len(target_sizes)
         assert target_sizes.shape[1] == 2
 
-        prob = F.softmax(out_logits, -1)
-        scores, labels = prob[..., :-1].max(-1)
+        prob = F.softmax(out_logits, -1)  # 将logits转换为概率
+        scores, labels = prob[..., :-1].max(-1)  # 获取最高概率及其对应的类别
 
+        # 边界框坐标转换: 将边界框从中心点格式 [cx, cy, w, h] 转换为左上右下角格式 [x1, y1, x2, y2]
         # convert to [x0, y0, x1, y1] format
         boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
         # and from relative [0, 1] to absolute [0, height] coordinates

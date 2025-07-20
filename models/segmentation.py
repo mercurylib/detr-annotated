@@ -223,17 +223,24 @@ class PostProcessSegm(nn.Module):
     @torch.no_grad()
     def forward(self, results, outputs, orig_target_sizes, max_target_sizes):
         assert len(orig_target_sizes) == len(max_target_sizes)
+        # 1. 获取最大尺寸
         max_h, max_w = max_target_sizes.max(0)[0].tolist()
+        # 2. 处理预测mask
         outputs_masks = outputs["pred_masks"].squeeze(2)
+        # 上采样到最大尺寸
         outputs_masks = F.interpolate(outputs_masks, size=(max_h, max_w), mode="bilinear", align_corners=False)
+        # 二值化：sigmoid后与阈值比较，得到二值mask
         outputs_masks = (outputs_masks.sigmoid() > self.threshold).cpu()
 
         for i, (cur_mask, t, tt) in enumerate(zip(outputs_masks, max_target_sizes, orig_target_sizes)):
             img_h, img_w = t[0], t[1]
+            # 1. 裁剪到实际图片大小
             results[i]["masks"] = cur_mask[:, :img_h, :img_w].unsqueeze(1)
+            # 2. 调整到原始图片尺寸
             results[i]["masks"] = F.interpolate(
                 results[i]["masks"].float(), size=tuple(tt.tolist()), mode="nearest"
             ).byte()
+            # 以上操作能够便于对不同大小的输入图片进行处理
 
         return results
 

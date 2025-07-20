@@ -45,18 +45,39 @@ class Transformer(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, src, mask, query_embed, pos_embed):
-        # flatten NxCxHxW to HWxNxC
+        # 1. flatten NxCxHxW to HWxNxC
         bs, c, h, w = src.shape
         src = src.flatten(2).permute(2, 0, 1)
+
+        # 2. 位置编码维度变换做了同样处理
         pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
+
+        # 3. 准备query_embed [N,C] -> [N,1,C] -> [N,B,C]
         query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
         mask = mask.flatten(1)
 
         tgt = torch.zeros_like(query_embed)
+        # 4. encoder输入
+        # src: [HW,B,C] 图像特征
+        # mask: [B,HW] padding mask
+        # pos_embed: [HW,B,C] 位置编码
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
+
+        # 5. decoder输入
+        # tgt: [N,B,C] 初始全0
+        # memory: [HW,B,C] encoder输出的图像特征
+        # mask: [B,HW] padding mask
+        # sin/cos pos_embed: [HW,B,C] 图像位置编码
+        # query_embed 作为 decoder 的 query_pos: [N,B,C] query位置编码
         hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
                           pos=pos_embed, query_pos=query_embed)
+
+        # 6. 输出
+        # hs: [L,N,B,C] 解码器输出，记得这里L是decoder层数，N是query数，B是batch size，C是query特征维度
+        # memory: [HW,B,C] 图像特征
         return hs.transpose(1, 2), memory.permute(1, 2, 0).view(bs, c, h, w)
+        # hs.transpose(1, 2): [L,B,N,C]
+        # memory.permute(1, 2, 0).view(bs, c, h, w): [B,C,H,W]
 
 
 class TransformerEncoder(nn.Module):
@@ -129,16 +150,21 @@ class TransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        # Implementation of Feedforward model
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.self_attn = nn.MultiheadAttention(
+            d_model,            # 输入特征维度
+            nhead,              # 8个注意力头
+            dropout=dropout     # 注意力dropout
+        )
+        # 每个头的维度是: d_model/nhead
+        # 两层 MLP，中间升维再降维
+        self.linear1 = nn.Linear(d_model, dim_feedforward)   # 升维
+        self.dropout = nn.Dropout(dropout)                 # FFN的dropout
+        self.linear2 = nn.Linear(dim_feedforward, d_model)   # 降维
 
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model)   # 自注意力后的LayerNorm
+        self.norm2 = nn.LayerNorm(d_model)   # FFN后的LayerNorm
+        self.dropout1 = nn.Dropout(dropout)  # 自注意力的残差dropout
+        self.dropout2 = nn.Dropout(dropout)  # FFN的残差dropout
 
         self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
@@ -151,14 +177,22 @@ class TransformerEncoderLayer(nn.Module):
                      src_mask: Optional[Tensor] = None,
                      src_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None):
-        q = k = self.with_pos_embed(src, pos)
-        src2 = self.self_attn(q, k, value=src, attn_mask=src_mask,
-                              key_padding_mask=src_key_padding_mask)[0]
-        src = src + self.dropout1(src2)
-        src = self.norm1(src)
+
+        # 1. 自注意力
+        q = k = self.with_pos_embed(src, pos)   # q,k加入位置编码
+        src2 = self.self_attn(
+            q, k, value=src,                    # value不加位置编码
+            attn_mask=src_mask,
+            key_padding_mask=src_key_padding_mask
+        )[0]
+        src = src + self.dropout1(src2)         # 残差连接
+        src = self.norm1(src)                   # LayerNorm
+
+        # 2. FFN
         src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
-        src = src + self.dropout2(src2)
-        src = self.norm2(src)
+        src = src + self.dropout2(src2)         # 残差连接
+        src = self.norm2(src)                   # LayerNorm
+        
         return src
 
     def forward_pre(self, src,
@@ -189,19 +223,21 @@ class TransformerDecoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False):
         super().__init__()
+        # 1. 自注意力层(Self-Attention)
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        # 2. 交叉注意力层(Cross-Attention)
         self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        # Implementation of Feedforward model
+        # 3. 前馈神经网络(Feedforward)
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
 
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.norm3 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.dropout3 = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model)   # self-attn后LayerNorm
+        self.norm2 = nn.LayerNorm(d_model)   # cross-attn后LayerNorm
+        self.norm3 = nn.LayerNorm(d_model)   # FFN后LayerNorm
+        self.dropout1 = nn.Dropout(dropout)  # self-attn的残差dropout
+        self.dropout2 = nn.Dropout(dropout)  # cross-attn的残差dropout
+        self.dropout3 = nn.Dropout(dropout)  # FFN的残差dropout
 
         self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
@@ -216,17 +252,25 @@ class TransformerDecoderLayer(nn.Module):
                      memory_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None,
                      query_pos: Optional[Tensor] = None):
-        q = k = self.with_pos_embed(tgt, query_pos)
-        tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,
+        # 1. Self-Attention
+        q = k = self.with_pos_embed(tgt, query_pos)                     # Q和K相同，加入query位置编码
+        tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,      # V是原始输入
                               key_padding_mask=tgt_key_padding_mask)[0]
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
-        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
-                                   key=self.with_pos_embed(memory, pos),
-                                   value=memory, attn_mask=memory_mask,
-                                   key_padding_mask=memory_key_padding_mask)[0]
+
+        # 2. Cross-Attention
+        tgt2 = self.multihead_attn(
+            query=self.with_pos_embed(tgt, query_pos),  # Q来自前面自注意力后得到的tgt，加入query位置编码
+            key=self.with_pos_embed(memory, pos),       # K来自encoder，加入encoder位置编码
+            value=memory,                               # V来自encoder，不加位置编码
+            attn_mask=memory_mask,
+            key_padding_mask=memory_key_padding_mask
+        )[0]
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
+
+        # 3. FFN
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)

@@ -96,16 +96,24 @@ class Backbone(BackboneBase):
 class Joiner(nn.Sequential):
     def __init__(self, backbone, position_embedding):
         super().__init__(backbone, position_embedding)
-
+        # self[0] 是 backbone
+        # self[1] 是 position_embedding
+        
     def forward(self, tensor_list: NestedTensor):
-        xs = self[0](tensor_list)
-        out: List[NestedTensor] = []
-        pos = []
+        # 1. 首先通过backbone得到多尺度特征
+        xs = self[0](tensor_list)  # 得到dict形式的特征图
+        
+        # 2. 准备两个列表存结果
+        out: List[NestedTensor] = []  # 存特征图
+        pos = []  # 存位置编码
+        
+        # 3. 对每个尺度的特征
         for name, x in xs.items():
-            out.append(x)
-            # position encoding
+            out.append(x)  # 保存特征图
+            # 对每个特征图计算位置编码
             pos.append(self[1](x).to(x.tensors.dtype))
-
+        
+        # 4. 返回特征图和对应的位置编码
         return out, pos
 
 
